@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <memory.h>
 #include <time.h>
+#include <complex.h>
+#include <fftw3.h>
 
 #define FS 48000.0f
 #define FL 1000.0f
@@ -14,17 +16,17 @@
 #define P 2*M+1 
 #define N 1024 // N >= L+P-1 (480+257-1=736)
 
-#define FRAME_BASED
-#define FRAME_BASED_WITH_TIME_DOMAIN
-//#define USE_FFT
+// #define FRAME_BASED
+// #define FRAME_BASED_WITH_TIME_DOMAIN
+// #define USE_FFT
 
 
 typedef struct _wav {
 	int fs;
 	char header[44];
 	size_t length;
-	short *LChannel;
-	short *RChannel;
+	float *LChannel;
+	float *RChannel;
 } wav;
 
 int wav_read_fn(char *fn, wav *p_wav)
@@ -44,13 +46,13 @@ int wav_read_fn(char *fn, wav *p_wav)
 		i++;
 	}
 	p_wav->length = i / 2;
-	p_wav->LChannel = (short *) calloc(p_wav->length, sizeof(short));
+	p_wav->LChannel = (float *) calloc(p_wav->length, sizeof(float));
 	if( p_wav->LChannel==NULL ) {
 		fprintf(stderr, "cannot allocate memory for LChannel in wav_read_fn\n");
 		fclose(fp);
 		return 0;
 	}
-	p_wav->RChannel = (short *) calloc(p_wav->length, sizeof(short));
+	p_wav->RChannel = (float *) calloc(p_wav->length, sizeof(float));
 	if( p_wav->RChannel==NULL ) {
 		fprintf(stderr, "cannot allocate memory for RChannel in wav_read_fn\n");
 		fclose(fp);
@@ -58,8 +60,8 @@ int wav_read_fn(char *fn, wav *p_wav)
 	}
 	fseek(fp, 44, SEEK_SET);
 	for(i=0;i<p_wav->length;i++) {
-		fread(p_wav->LChannel+i, sizeof(short), 1, fp);
-		fread(p_wav->RChannel+i, sizeof(short), 1, fp);
+		fread(p_wav->LChannel+i, sizeof(float), 1, fp);
+		fread(p_wav->RChannel+i, sizeof(float), 1, fp);
 	}
 	fclose(fp);
 	return 1;
@@ -74,10 +76,12 @@ int wav_save_fn(char *fn, wav *p_wav)
 		return 0;
 	}
 	fwrite(p_wav->header, sizeof(char), 44, fp);
-	for(i=0;i<p_wav->length;i++) {
-		fwrite(p_wav->LChannel+i, sizeof(short), 1, fp);
-		fwrite(p_wav->RChannel+i, sizeof(short), 1, fp);
-	}
+	for (size_t i = 0; i < p_wav->length; i++) {
+        short left = (short)roundf(p_wav->LChannel[i]);
+        short right = (short)roundf(p_wav->RChannel[i]);
+        fwrite(&left, sizeof(short), 1, fp);
+        fwrite(&right, sizeof(short), 1, fp);
+    }
 	fclose(fp);
 	return 1;
 }
@@ -85,12 +89,12 @@ int wav_save_fn(char *fn, wav *p_wav)
 int wav_init(size_t length, wav *p_wav)
 {
 	p_wav->length = length;
-	p_wav->LChannel = (short *) calloc(p_wav->length, sizeof(short));
+	p_wav->LChannel = (float *) calloc(p_wav->length, sizeof(float));
 	if( p_wav->LChannel==NULL ) {
 		fprintf(stderr, "cannot allocate memory for LChannel in wav_read_fn\n");
 		return 0;
 	}
-	p_wav->RChannel = (short *) calloc(p_wav->length, sizeof(short));
+	p_wav->RChannel = (float *) calloc(p_wav->length, sizeof(float));
 	if( p_wav->RChannel==NULL ) {
 		fprintf(stderr, "cannot allocate memory for RChannel in wav_read_fn\n");
 		return 0;
@@ -218,6 +222,44 @@ void conv_by_DFT(float x[N], float Hre[N], float Him[N], float y[N])
 	IDFT(y, Yre, Yim);
 }
 
+void FFT(float x[N], fftwf_complex X[N]) {
+    fftwf_plan p = fftwf_plan_dft_r2c_1d(N, x, X, FFTW_ESTIMATE);
+    fftwf_execute(p);
+    fftwf_destroy_plan(p);
+}
+
+void IFFT(fftwf_complex X[N], float x[N]) {
+    fftwf_plan p = fftwf_plan_dft_c2r_1d(N, X, x, FFTW_ESTIMATE); // 一維實數
+    fftwf_execute(p);
+    fftwf_destroy_plan(p);
+    for (int i = 0; i < N; i++) {
+        x[i] /= N; // Normalize
+    }
+}
+
+void conv_by_FFT(float x[N], float h[N], float y[N]) {
+    fftwf_complex X[N], H[N], Y[N];
+    float temp_x[N], temp_h[N];
+
+    // Zero padding
+    memset(temp_x, 0, sizeof(float) * N);
+    memset(temp_h, 0, sizeof(float) * N);
+    memcpy(temp_x, x, sizeof(float) * L);
+    memcpy(temp_h, h, sizeof(float) * P);
+
+    // Compute FFT of x and h
+    FFT(temp_x, X);
+    FFT(temp_h, H);
+
+    // Perform element-wise multiplication in frequency domain
+    for (int k = 0; k < N; k++) {
+        Y[k] = X[k] * H[k];
+    }
+
+    // Compute IFFT of Y
+    IFFT(Y, y);
+}
+
 int main(int argc, char **argv)
 {
 	wav wavin;
@@ -261,8 +303,8 @@ int main(int argc, char **argv)
 
 	// construct low-pass filter
 	for(n=0;n<(2*M+1);n++) {
-		h_L[n] = band_pass(M, n);
-        h_R[n] = band_pass(M, n);
+		h_L[n] = low_pass(M, n);
+        h_R[n] = low_pass(M, n);
 	}
 
     /*
@@ -305,7 +347,7 @@ int main(int argc, char **argv)
 #else
 		// conv in freq.
     #ifdef USE_FFT
-        // Please add code here
+        conv_by_FFT(x_r, h, y_r);
     #else
 		conv_by_DFT(x_r, Hre, Him, y_r);
     #endif
@@ -330,7 +372,7 @@ int main(int argc, char **argv)
 #else
         // conv in freq.
     #ifdef USE_FFT
-        // Please add code here
+        conv_by_FFT(x_r, h, y_r);
     #else
 		conv_by_DFT(x_r, Hre, Him, y_r);
     #endif
@@ -356,7 +398,7 @@ int main(int argc, char **argv)
 #else
     // conv in freq.
     #ifdef USE_FFT
-        // Please add code here
+        conv_by_FFT(x_r, h, y_r);
     #else
 		conv_by_DFT(x_r, Hre, Him, y_r);
     #endif
@@ -380,7 +422,7 @@ int main(int argc, char **argv)
 #else
     // conv in freq.
     #ifdef USE_FFT
-        // Please add code here
+        conv_by_FFT(x_r, h, y_r);
     #else
 		conv_by_DFT(x_r, Hre, Him, y_r);
     #endif
@@ -393,6 +435,8 @@ int main(int argc, char **argv)
 
     clock_t end = clock();
     double time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
+	printf("1");
+	printf("Processing time: %.15e seconds\n", time_spent);
     printf("It took %.15e msec to generate each sample with frame-based filtering\n",
         time_spent/((double)(wavin.length))/2.0);
 
@@ -415,6 +459,8 @@ int main(int argc, char **argv)
 	}
     clock_t end = clock();
     double time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
+	printf("2");
+	printf("Processing time: %.15e seconds\n", time_spent);
     printf("It took %.15e msec to generate each sample with time domain linear filtering\n",
         time_spent/((double)(wavin.length))/2.0);
 #endif
